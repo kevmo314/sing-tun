@@ -113,14 +113,25 @@ func (t *GVisor) Start() error {
 		Inet4LoopbackAddress: t.inet4LoopbackAddress,
 		Inet6LoopbackAddress: t.inet6LoopbackAddress,
 	}
-	ipStack, err := newGVisorStack(linkEndpoint, nicOptions, false, true)
+	ipStack, err := newGVisorStack(linkEndpoint, nicOptions, false, true, t.initTransport)
 	if err != nil {
+		if t.udpForwarder != nil {
+			t.udpForwarder.Close()
+		}
+		if t.icmpForwarder != nil {
+			t.icmpForwarder.Close()
+		}
 		return err
 	}
+	t.stack = ipStack
+	t.endpoint = linkEndpoint
+	return nil
+}
+
+func (t *GVisor) initTransport(ipStack *stack.Stack) error {
 	ipStack.SetTransportProtocolHandler(tcp.ProtocolNumber, NewTCPForwarderWithLoopback(t.ctx, ipStack, t.handler, t.inet4LoopbackAddress, t.inet6LoopbackAddress, t.tun).HandlePacket)
 	udpForwarder := NewUDPForwarder(t.ctx, ipStack, t.handler, t.udpNATOptions)
-	err = udpForwarder.Start()
-	if err != nil {
+	if err := udpForwarder.Start(); err != nil {
 		return err
 	}
 	ipStack.SetTransportProtocolHandler(udp.ProtocolNumber, udpForwarder.HandlePacket)
@@ -129,8 +140,6 @@ func (t *GVisor) Start() error {
 	ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpForwarder.HandlePacket)
 	ipStack.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpForwarder.HandlePacket)
 	t.icmpForwarder = icmpForwarder
-	t.stack = ipStack
-	t.endpoint = linkEndpoint
 	return nil
 }
 
@@ -215,10 +224,10 @@ func NewGVisorStack(ep stack.LinkEndpoint) (*stack.Stack, error) {
 }
 
 func NewGVisorStackWithOptions(ep stack.LinkEndpoint, opts stack.NICOptions, allowRawEndpoint bool) (*stack.Stack, error) {
-	return newGVisorStack(ep, opts, allowRawEndpoint, false)
+	return newGVisorStack(ep, opts, allowRawEndpoint, false, nil)
 }
 
-func newGVisorStack(ep stack.LinkEndpoint, opts stack.NICOptions, allowRawEndpoint bool, isLocalStack bool) (*stack.Stack, error) {
+func newGVisorStack(ep stack.LinkEndpoint, opts stack.NICOptions, allowRawEndpoint bool, isLocalStack bool, initTransport func(*stack.Stack) error) (*stack.Stack, error) {
 	stackOptions := stack.Options{
 		NetworkProtocols: []stack.NetworkProtocolFactory{
 			ipv4.NewProtocol,
@@ -235,8 +244,17 @@ func newGVisorStack(ep stack.LinkEndpoint, opts stack.NICOptions, allowRawEndpoi
 		stackOptions.RawFactory = new(raw.EndpointFactory)
 	}
 	ipStack := stack.New(stackOptions)
+	// CreateNIC attaches the endpoint and starts packet-reader goroutines.
+	// Publish transport handlers before those readers can access the stack.
+	if initTransport != nil {
+		if err := initTransport(ipStack); err != nil {
+			ipStack.Close()
+			return nil, err
+		}
+	}
 	err := ipStack.CreateNICWithOptions(DefaultNIC, ep, opts)
 	if err != nil {
+		ipStack.Close()
 		return nil, gonet.TranslateNetstackError(err)
 	}
 	ipStack.SetRouteTable([]tcpip.Route{
