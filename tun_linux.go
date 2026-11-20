@@ -664,6 +664,16 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 		}
 		handle := newRouteHandle()
 		defer handle.Close()
+		// Diff against what is installed rather than what the old options
+		// described: a previous update that failed partway, or a table flushed
+		// behind our back, must be repaired rather than reported as done.
+		installed, listErr := handle.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{
+			LinkIndex: tunLink.Attrs().Index,
+			Table:     tunOptions.IPRoute2TableIndex,
+		}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+		if listErr == nil {
+			oldRoutes = installed
+		}
 		return updateRoutes(handle, oldRoutes, newRoutes)
 	})
 }
@@ -687,6 +697,14 @@ func routeKeyOf(route *netlink.Route) routeKey {
 		if addr, ok := netip.AddrFromSlice(route.Dst.IP); ok {
 			ones, _ := route.Dst.Mask.Size()
 			key.dst = netip.PrefixFrom(addr.Unmap(), ones)
+		}
+	} else {
+		// The kernel reports a default route without a destination.
+		switch route.Family {
+		case unix.AF_INET:
+			key.dst = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
+		case unix.AF_INET6:
+			key.dst = netip.PrefixFrom(netip.IPv6Unspecified(), 0)
 		}
 	}
 	if addr, ok := netip.AddrFromSlice(route.Gw); ok {
