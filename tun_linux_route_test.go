@@ -27,14 +27,14 @@ func enterTestNetns(tb testing.TB) netlink.Link {
 		runtime.UnlockOSThread()
 		tb.Skip("get netns: ", err)
 	}
-	ns, err := netns.New()
-	if err != nil {
+	// Unshare directly: netns.New switches namespaces before opening its handle,
+	// so a failure there could leave this thread in the new namespace.
+	if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
 		origin.Close()
 		runtime.UnlockOSThread()
-		tb.Skip("new netns (needs CAP_SYS_ADMIN): ", err)
+		tb.Skip("unshare netns (needs CAP_SYS_ADMIN): ", err)
 	}
 	tb.Cleanup(func() {
-		ns.Close()
 		if netns.Set(origin) == nil {
 			runtime.UnlockOSThread()
 		}
@@ -120,6 +120,60 @@ func TestUpdateRoutes(t *testing.T) {
 	}
 	if got := len(installedRoutes(t)); got != len(newRoutes) {
 		t.Fatalf("expected %d routes, got %d", len(newRoutes), got)
+	}
+}
+
+// listInstalled reads back the routes on link in the test table, as
+// UpdateRouteOptions does.
+func listInstalled(tb testing.TB, handle *netlink.Handle, link netlink.Link) []netlink.Route {
+	tb.Helper()
+	list, err := handle.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{
+		LinkIndex: link.Attrs().Index, Table: testRouteTable,
+	}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return list
+}
+
+func TestUpdateRoutesRepairsInstalledState(t *testing.T) {
+	link := enterTestNetns(t)
+	handle := newRouteHandle()
+	defer handle.Close()
+
+	wanted := testRoutes(link, 0, 100)
+	// Default routes come back from the kernel without a destination; they must
+	// still match the configured 0.0.0.0/0 and ::/0 rather than be replaced.
+	for _, prefix := range []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")} {
+		wanted = append(wanted, netlink.Route{Dst: prefixToIPNet(prefix), LinkIndex: link.Attrs().Index, Table: testRouteTable})
+	}
+	for i := range wanted {
+		if err := handle.RouteAdd(&wanted[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Lose some routes behind the update's back, as a partial failure or a
+	// manual flush would.
+	for i := 0; i < 40; i++ {
+		if err := handle.RouteDel(&wanted[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := updateRoutes(handle, listInstalled(t, handle, link), wanted); err != nil {
+		t.Fatal(err)
+	}
+	installed := listInstalled(t, handle, link)
+	if len(installed) != len(wanted) {
+		t.Fatalf("expected %d routes after repair, got %d", len(wanted), len(installed))
+	}
+	keys := make(map[routeKey]bool, len(installed))
+	for i := range installed {
+		keys[routeKeyOf(&installed[i])] = true
+	}
+	for i := range wanted {
+		if !keys[routeKeyOf(&wanted[i])] {
+			t.Fatalf("route %s missing after repair", wanted[i].Dst)
+		}
 	}
 }
 
