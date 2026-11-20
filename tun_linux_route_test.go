@@ -155,7 +155,7 @@ func TestUpdateRoutesRepairsInstalledState(t *testing.T) {
 	}
 	// Lose some routes behind the update's back, as a partial failure or a
 	// manual flush would.
-	for i := 0; i < 40; i++ {
+	for i := range 40 {
 		if err := handle.RouteDel(&wanted[i]); err != nil {
 			t.Fatal(err)
 		}
@@ -212,6 +212,38 @@ func TestUpdateRoutesOnlyRemovesOwnRoutes(t *testing.T) {
 	}
 }
 
+func TestUpdateRoutesDoesNotOverwriteOtherInterfaces(t *testing.T) {
+	link := enterTestNetns(t)
+	handle := newRouteHandle()
+	defer handle.Close()
+	if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "rt1"}}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := netlink.LinkByName("rt1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = netlink.LinkSetUp(other); err != nil {
+		t.Fatal(err)
+	}
+	prefix := prefixToIPNet(netip.MustParsePrefix("198.51.100.0/24"))
+	foreign := netlink.Route{Dst: prefix, LinkIndex: other.Attrs().Index, Table: testRouteTable}
+	if err = handle.RouteAdd(&foreign); err != nil {
+		t.Fatal(err)
+	}
+	wanted := []netlink.Route{{Dst: prefix, LinkIndex: link.Attrs().Index, Table: testRouteTable}}
+	if err = updateRoutes(handle, nil, wanted, map[routeKey]struct{}{}); err == nil {
+		t.Fatal("expected a conflict with another interface's route to be reported")
+	}
+	list, err := handle.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: testRouteTable}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].LinkIndex != other.Attrs().Index {
+		t.Fatalf("another interface's route was overwritten: %+v", list)
+	}
+}
+
 func TestRouteKeyOf(t *testing.T) {
 	a := netlink.Route{Dst: &net.IPNet{IP: net.IPv4(1, 2, 3, 0), Mask: net.CIDRMask(24, 32)}, Table: 1, LinkIndex: 2}
 	b := netlink.Route{Dst: &net.IPNet{IP: net.IP{1, 2, 3, 0}, Mask: net.CIDRMask(24, 32)}, Table: 1, LinkIndex: 2}
@@ -229,8 +261,7 @@ func benchmarkRoutes(b *testing.B, handle func() *netlink.Handle) {
 	h := handle()
 	defer h.Close()
 	routes := testRoutes(link, 0, 10000)
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
+	for b.Loop() {
 		for i := range routes {
 			if err := h.RouteAdd(&routes[i]); err != nil {
 				b.Fatal(err)
