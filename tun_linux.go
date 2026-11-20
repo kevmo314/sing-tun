@@ -651,13 +651,95 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 		if err != nil {
 			return E.Cause(err, "find tun interface")
 		}
-		err = t.unsetRoute0(tunLink)
-		if err != nil {
-			return E.Cause(err, "unset old routes")
+		// Build the old route set before swapping options; like unsetRoute0,
+		// a failure here means no old routes are removed.
+		oldRoutes, oldErr := t.routes(tunLink)
+		if oldErr != nil {
+			oldRoutes = nil
 		}
 		t.options = tunOptions
-		return t.setRoute(tunLink)
+		newRoutes, err := t.routes(tunLink)
+		if err != nil {
+			return E.Cause(err, "build routes")
+		}
+		handle := newRouteHandle()
+		defer handle.Close()
+		return updateRoutes(handle, oldRoutes, newRoutes)
 	})
+}
+
+type routeDstKey struct {
+	table int
+	dst   netip.Prefix
+}
+
+type routeKey struct {
+	routeDstKey
+	link    int
+	gateway netip.Addr
+}
+
+func routeKeyOf(route *netlink.Route) routeKey {
+	var key routeKey
+	key.table = route.Table
+	key.link = route.LinkIndex
+	if route.Dst != nil {
+		if addr, ok := netip.AddrFromSlice(route.Dst.IP); ok {
+			ones, _ := route.Dst.Mask.Size()
+			key.dst = netip.PrefixFrom(addr.Unmap(), ones)
+		}
+	}
+	if addr, ok := netip.AddrFromSlice(route.Gw); ok {
+		key.gateway = addr.Unmap()
+	}
+	return key
+}
+
+// updateRoutes moves the installed route set from oldRoutes to newRoutes
+// without a window where unchanged destinations are missing: routes that are
+// new are installed first (replacing in place when only the gateway/link of a
+// destination changed), then routes that are no longer wanted are removed.
+func updateRoutes(handle *netlink.Handle, oldRoutes, newRoutes []netlink.Route) error {
+	oldKeys := make(map[routeKey]struct{}, len(oldRoutes))
+	oldDsts := make(map[routeDstKey]struct{}, len(oldRoutes))
+	for i := range oldRoutes {
+		key := routeKeyOf(&oldRoutes[i])
+		oldKeys[key] = struct{}{}
+		oldDsts[key.routeDstKey] = struct{}{}
+	}
+	newKeys := make(map[routeKey]struct{}, len(newRoutes))
+	newDsts := make(map[routeDstKey]struct{}, len(newRoutes))
+	for i := range newRoutes {
+		route := &newRoutes[i]
+		key := routeKeyOf(route)
+		newKeys[key] = struct{}{}
+		newDsts[key.routeDstKey] = struct{}{}
+		if _, loaded := oldKeys[key]; loaded {
+			continue
+		}
+		var err error
+		if _, loaded := oldDsts[key.routeDstKey]; loaded {
+			err = handle.RouteReplace(route)
+		} else {
+			err = handle.RouteAdd(route)
+		}
+		if err != nil {
+			return E.Cause(err, "add route ", i)
+		}
+	}
+	for i := range oldRoutes {
+		route := &oldRoutes[i]
+		key := routeKeyOf(route)
+		if _, loaded := newKeys[key]; loaded {
+			continue
+		}
+		if _, loaded := newDsts[key.routeDstKey]; loaded {
+			// Already replaced in place above.
+			continue
+		}
+		_ = handle.RouteDel(route)
+	}
+	return nil
 }
 
 func (t *NativeTun) routes(tunLink netlink.Link) ([]netlink.Route, error) {
@@ -1118,8 +1200,10 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 	if err != nil {
 		return E.Cause(err, "build routes")
 	}
-	for i, route := range routes {
-		err := netlink.RouteAdd(&route)
+	handle := newRouteHandle()
+	defer handle.Close()
+	for i := range routes {
+		err = handle.RouteAdd(&routes[i])
 		if err != nil {
 			return E.Cause(err, "add route ", i)
 		}
@@ -1127,11 +1211,28 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 	return nil
 }
 
+// newRouteHandle returns a netlink handle with a single NETLINK_ROUTE socket
+// opened in the calling thread's network namespace (callers run inside
+// runInNetworkNamespace). The package-level netlink functions open, bind and
+// close a fresh socket for every request, which dominates when installing
+// tens of thousands of routes on slow CPUs. If the socket cannot be opened,
+// the zero Handle is returned, which behaves like the package-level functions.
+func newRouteHandle() *netlink.Handle {
+	handle, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	if err != nil {
+		return &netlink.Handle{}
+	}
+	return handle
+}
+
 func (t *NativeTun) setRules() error {
-	for i, rule := range t.rules() {
-		err := netlink.RuleAdd(rule)
+	rules := t.rules()
+	handle := newRouteHandle()
+	defer handle.Close()
+	for i, rule := range rules {
+		err := handle.RuleAdd(rule)
 		if err != nil {
-			return E.Cause(err, "add rule ", i, "/", len(t.rules()))
+			return E.Cause(err, "add rule ", i, "/", len(rules))
 		}
 	}
 	return nil
@@ -1150,8 +1251,10 @@ func (t *NativeTun) unsetRoute() error {
 
 func (t *NativeTun) unsetRoute0(tunLink netlink.Link) error {
 	if routes, err := t.routes(tunLink); err == nil {
-		for _, route := range routes {
-			_ = netlink.RouteDel(&route)
+		handle := newRouteHandle()
+		defer handle.Close()
+		for i := range routes {
+			_ = handle.RouteDel(&routes[i])
 		}
 	}
 	return nil
@@ -1161,12 +1264,14 @@ func (t *NativeTun) unsetRules() error {
 	if t.options.FileDescriptor > 0 {
 		return nil
 	}
+	handle := newRouteHandle()
+	defer handle.Close()
 	if len(t.ruleIndex6) > 0 {
 		for _, index := range t.ruleIndex6 {
 			ruleToDel := netlink.NewRule()
 			ruleToDel.Family = unix.AF_INET6
 			ruleToDel.Priority = index
-			err := netlink.RuleDel(ruleToDel)
+			err := handle.RuleDel(ruleToDel)
 			if err != nil {
 				return E.Cause(err, "unset rule6 ", index)
 			}
@@ -1174,7 +1279,7 @@ func (t *NativeTun) unsetRules() error {
 		t.ruleIndex6 = nil
 	}
 	if t.options.AutoRoute {
-		ruleList, err := netlink.RuleList(netlink.FAMILY_ALL)
+		ruleList, err := handle.RuleList(netlink.FAMILY_ALL)
 		if err != nil {
 			return E.Cause(err, "list rules")
 		}
@@ -1185,7 +1290,7 @@ func (t *NativeTun) unsetRules() error {
 				ruleToDel := netlink.NewRule()
 				ruleToDel.Family = rule.Family
 				ruleToDel.Priority = rule.Priority
-				err = netlink.RuleDel(ruleToDel)
+				err = handle.RuleDel(ruleToDel)
 				if err != nil {
 					return E.Cause(err, "unset rule ", rule.Priority, " for ", rule.Family)
 				}
