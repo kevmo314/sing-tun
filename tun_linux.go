@@ -641,9 +641,11 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 		if oldErr != nil {
 			oldRoutes = nil
 		}
+		previous := t.options
 		t.options = tunOptions
 		newRoutes, err := t.routes(tunLink)
 		if err != nil {
+			t.options = previous
 			return E.Cause(err, "build routes")
 		}
 		handle := newRouteHandle()
@@ -665,7 +667,12 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 				}
 			}
 		}
-		return updateRoutes(handle, oldRoutes, newRoutes, installed)
+		if err = updateRoutes(handle, oldRoutes, newRoutes, installed); err != nil {
+			// Keep describing the old set: the routes only it had are still
+			// installed, and a retry must know to remove them.
+			t.options = previous
+		}
+		return err
 	})
 }
 
@@ -712,6 +719,10 @@ func routeKeyOf(route *netlink.Route) routeKey {
 // already there are skipped; with installed nil (unknown), every wanted route
 // is (re)applied with an idempotent replace.
 func updateRoutes(handle *netlink.Handle, oldRoutes, newRoutes []netlink.Route, installed map[routeKey]struct{}) error {
+	oldDsts := make(map[routeDstKey]struct{}, len(oldRoutes))
+	for i := range oldRoutes {
+		oldDsts[routeKeyOf(&oldRoutes[i]).routeDstKey] = struct{}{}
+	}
 	newKeys := make(map[routeKey]struct{}, len(newRoutes))
 	newDsts := make(map[routeDstKey]struct{}, len(newRoutes))
 	for i := range newRoutes {
@@ -724,9 +735,17 @@ func updateRoutes(handle *netlink.Handle, oldRoutes, newRoutes []netlink.Route, 
 				continue
 			}
 		}
-		// Replace covers both a missing route and one whose gateway or link
-		// changed for the same destination.
-		if err := handle.RouteReplace(route); err != nil {
+		var err error
+		if _, ours := oldDsts[key.routeDstKey]; ours {
+			// A destination this TUN already routed: replace it in place, which
+			// also covers a changed gateway or a route that went missing.
+			err = handle.RouteReplace(route)
+		} else {
+			// Anything else is added, never replaced, so a route another
+			// component owns is reported rather than overwritten.
+			err = handle.RouteAdd(route)
+		}
+		if err != nil {
 			return E.Cause(err, "add route ", i)
 		}
 	}
