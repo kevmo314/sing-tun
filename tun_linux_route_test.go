@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"slices"
 	"testing"
 
 	"github.com/sagernet/netlink"
@@ -101,7 +102,7 @@ func TestUpdateRoutes(t *testing.T) {
 		}
 	}
 	newRoutes := testRoutes(link, 100, 200)
-	if err := updateRoutes(handle, oldRoutes, newRoutes); err != nil {
+	if err := updateRoutes(handle, oldRoutes, newRoutes, nil); err != nil {
 		t.Fatal(err)
 	}
 	installed := installedRoutes(t)
@@ -115,7 +116,7 @@ func TestUpdateRoutes(t *testing.T) {
 	}
 
 	// Unchanged set is a no-op.
-	if err := updateRoutes(handle, newRoutes, newRoutes); err != nil {
+	if err := updateRoutes(handle, newRoutes, newRoutes, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(installedRoutes(t)); got != len(newRoutes) {
@@ -159,21 +160,55 @@ func TestUpdateRoutesRepairsInstalledState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := updateRoutes(handle, listInstalled(t, handle, link), wanted); err != nil {
+	installed := make(map[routeKey]struct{})
+	for _, route := range listInstalled(t, handle, link) {
+		installed[routeKeyOf(&route)] = struct{}{}
+	}
+	if err := updateRoutes(handle, wanted, wanted, installed); err != nil {
 		t.Fatal(err)
 	}
-	installed := listInstalled(t, handle, link)
-	if len(installed) != len(wanted) {
-		t.Fatalf("expected %d routes after repair, got %d", len(wanted), len(installed))
+	after := listInstalled(t, handle, link)
+	if len(after) != len(wanted) {
+		t.Fatalf("expected %d routes after repair, got %d", len(wanted), len(after))
 	}
-	keys := make(map[routeKey]bool, len(installed))
-	for i := range installed {
-		keys[routeKeyOf(&installed[i])] = true
+	keys := make(map[routeKey]bool, len(after))
+	for i := range after {
+		keys[routeKeyOf(&after[i])] = true
 	}
 	for i := range wanted {
 		if !keys[routeKeyOf(&wanted[i])] {
 			t.Fatalf("route %s missing after repair", wanted[i].Dst)
 		}
+	}
+}
+
+func TestUpdateRoutesOnlyRemovesOwnRoutes(t *testing.T) {
+	link := enterTestNetns(t)
+	handle := newRouteHandle()
+	defer handle.Close()
+
+	defaultRoute := netlink.Route{Dst: prefixToIPNet(netip.MustParsePrefix("0.0.0.0/0")), LinkIndex: link.Attrs().Index, Table: testRouteTable}
+	oldRoutes := append(testRoutes(link, 0, 10), defaultRoute)
+	foreign := netlink.Route{Dst: prefixToIPNet(netip.MustParsePrefix("192.0.2.0/24")), LinkIndex: link.Attrs().Index, Table: testRouteTable}
+	for _, route := range append(slices.Clone(oldRoutes), foreign) {
+		if err := handle.RouteAdd(&route); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Narrower prefixes replace the old default route.
+	newRoutes := testRoutes(link, 0, 10)
+	if err := updateRoutes(handle, oldRoutes, newRoutes, nil); err != nil {
+		t.Fatal(err)
+	}
+	installed := installedRoutes(t)
+	if installed["0.0.0.0/0"] || installed["<nil>"] {
+		t.Fatal("old default route was left installed")
+	}
+	if !installed["192.0.2.0/24"] {
+		t.Fatal("a route this instance did not configure was removed")
+	}
+	if len(installed) != len(newRoutes)+1 {
+		t.Fatalf("expected %d routes, got %d", len(newRoutes)+1, len(installed))
 	}
 }
 

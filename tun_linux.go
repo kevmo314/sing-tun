@@ -648,17 +648,24 @@ func (t *NativeTun) UpdateRouteOptions(tunOptions Options) error {
 		}
 		handle := newRouteHandle()
 		defer handle.Close()
-		// Diff against what is installed rather than what the old options
-		// described: a previous update that failed partway, or a table flushed
-		// behind our back, must be repaired rather than reported as done.
-		installed, listErr := handle.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{
-			LinkIndex: tunLink.Attrs().Index,
-			Table:     tunOptions.IPRoute2TableIndex,
-		}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
-		if listErr == nil {
-			oldRoutes = installed
+		// What is installed decides only what still needs adding, so a retry
+		// after a partial failure, or a table flushed behind our back, is
+		// repaired. Deletions come from the old options alone: nothing this
+		// instance did not configure is removed.
+		var installed map[routeKey]struct{}
+		if table := tunOptions.IPRoute2TableIndex; table != 0 {
+			list, listErr := handle.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{
+				LinkIndex: tunLink.Attrs().Index,
+				Table:     table,
+			}, netlink.RT_FILTER_OIF|netlink.RT_FILTER_TABLE)
+			if listErr == nil {
+				installed = make(map[routeKey]struct{}, len(list))
+				for i := range list {
+					installed[routeKeyOf(&list[i])] = struct{}{}
+				}
+			}
 		}
-		return updateRoutes(handle, oldRoutes, newRoutes)
+		return updateRoutes(handle, oldRoutes, newRoutes, installed)
 	})
 }
 
@@ -697,18 +704,14 @@ func routeKeyOf(route *netlink.Route) routeKey {
 	return key
 }
 
-// updateRoutes moves the installed route set from oldRoutes to newRoutes
-// without a window where unchanged destinations are missing: routes that are
-// new are installed first (replacing in place when only the gateway/link of a
-// destination changed), then routes that are no longer wanted are removed.
-func updateRoutes(handle *netlink.Handle, oldRoutes, newRoutes []netlink.Route) error {
-	oldKeys := make(map[routeKey]struct{}, len(oldRoutes))
-	oldDsts := make(map[routeDstKey]struct{}, len(oldRoutes))
-	for i := range oldRoutes {
-		key := routeKeyOf(&oldRoutes[i])
-		oldKeys[key] = struct{}{}
-		oldDsts[key.routeDstKey] = struct{}{}
-	}
+// updateRoutes moves the route set from oldRoutes to newRoutes without a
+// window where unchanged destinations are missing: wanted routes are installed
+// first, then routes of the old set that are no longer wanted are removed.
+//
+// installed is what the kernel reports for the TUN's table. Wanted routes
+// already there are skipped; with installed nil (unknown), every wanted route
+// is (re)applied with an idempotent replace.
+func updateRoutes(handle *netlink.Handle, oldRoutes, newRoutes []netlink.Route, installed map[routeKey]struct{}) error {
 	newKeys := make(map[routeKey]struct{}, len(newRoutes))
 	newDsts := make(map[routeDstKey]struct{}, len(newRoutes))
 	for i := range newRoutes {
@@ -716,27 +719,26 @@ func updateRoutes(handle *netlink.Handle, oldRoutes, newRoutes []netlink.Route) 
 		key := routeKeyOf(route)
 		newKeys[key] = struct{}{}
 		newDsts[key.routeDstKey] = struct{}{}
-		if _, loaded := oldKeys[key]; loaded {
-			continue
+		if installed != nil {
+			if _, ok := installed[key]; ok {
+				continue
+			}
 		}
-		var err error
-		if _, loaded := oldDsts[key.routeDstKey]; loaded {
-			err = handle.RouteReplace(route)
-		} else {
-			err = handle.RouteAdd(route)
-		}
-		if err != nil {
+		// Replace covers both a missing route and one whose gateway or link
+		// changed for the same destination.
+		if err := handle.RouteReplace(route); err != nil {
 			return E.Cause(err, "add route ", i)
 		}
 	}
 	for i := range oldRoutes {
 		route := &oldRoutes[i]
 		key := routeKeyOf(route)
-		if _, loaded := newKeys[key]; loaded {
+		if _, ok := newKeys[key]; ok {
 			continue
 		}
-		if _, loaded := newDsts[key.routeDstKey]; loaded {
-			// Already replaced in place above.
+		if _, ok := newDsts[key.routeDstKey]; ok {
+			// Same table and destination: replaced in place above. A changed
+			// table index keys differently, so the old table is cleaned up.
 			continue
 		}
 		_ = handle.RouteDel(route)
