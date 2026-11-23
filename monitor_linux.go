@@ -15,10 +15,7 @@ import (
 )
 
 type networkUpdateMonitor struct {
-	routeUpdate   chan netlink.RouteUpdate
-	linkUpdate    chan netlink.LinkUpdate
-	addressUpdate chan netlink.AddrUpdate
-	close         chan struct{}
+	close chan struct{}
 
 	access    sync.Mutex
 	callbacks list.List[NetworkUpdateCallback]
@@ -33,11 +30,8 @@ var ErrNetlinkBanned = E.New(
 
 func NewNetworkUpdateMonitor(logger logger.Logger) (NetworkUpdateMonitor, error) {
 	monitor := &networkUpdateMonitor{
-		routeUpdate:   make(chan netlink.RouteUpdate, 2),
-		linkUpdate:    make(chan netlink.LinkUpdate, 2),
-		addressUpdate: make(chan netlink.AddrUpdate, 2),
-		close:         make(chan struct{}),
-		logger:        logger,
+		close:  make(chan struct{}),
+		logger: logger,
 	}
 	// check is netlink banned by google
 	if runtime.GOOS == "android" {
@@ -56,38 +50,131 @@ func NewNetworkUpdateMonitor(logger logger.Logger) (NetworkUpdateMonitor, error)
 	return monitor, nil
 }
 
-func (m *networkUpdateMonitor) Start() error {
-	err := netlink.RouteSubscribe(m.routeUpdate, m.close)
-	if err != nil {
-		return E.Cause(err, "subscribe route updates")
+// subscription is one netlink multicast subscription. netlink closes updates
+// when its reader stops, which it does on any receive error: ENOBUFS when a
+// burst of route changes overflows the socket, such as installing a large
+// auto_route exclusion list. A closed channel is always ready, so it has to be
+// noticed and replaced rather than selected on again.
+type subscription[T any] struct {
+	updates chan T
+	done    chan struct{}
+}
+
+func subscribe[T any](fn func(chan<- T, <-chan struct{}) error) (subscription[T], error) {
+	s := subscription[T]{updates: make(chan T, 2), done: make(chan struct{})}
+	if err := fn(s.updates, s.done); err != nil {
+		close(s.done)
+		return subscription[T]{}, err
 	}
-	err = netlink.LinkSubscribe(m.linkUpdate, m.close)
-	if err != nil {
-		return E.Cause(err, "subscribe link updates")
+	return s, nil
+}
+
+// stop releases the subscription's socket; netlink closes it once done closes.
+func (s *subscription[T]) stop() {
+	if s.done != nil {
+		close(s.done)
 	}
-	err = netlink.AddrSubscribe(m.addressUpdate, m.close)
-	if err != nil {
-		return E.Cause(err, "subscribe address updates")
+	*s = subscription[T]{}
+}
+
+type netlinkSubscriptions struct {
+	route   subscription[netlink.RouteUpdate]
+	link    subscription[netlink.LinkUpdate]
+	address subscription[netlink.AddrUpdate]
+}
+
+// resubscribe restores whichever subscriptions have ended,
+// stopping at the first that cannot be restored.
+func (s *netlinkSubscriptions) resubscribe() (err error) {
+	if s.route.updates == nil {
+		if s.route, err = subscribe(netlink.RouteSubscribe); err != nil {
+			return E.Cause(err, "subscribe route updates")
+		}
 	}
-	go m.loopUpdate(time.Second)
+	if s.link.updates == nil {
+		if s.link, err = subscribe(netlink.LinkSubscribe); err != nil {
+			return E.Cause(err, "subscribe link updates")
+		}
+	}
+	if s.address.updates == nil {
+		if s.address, err = subscribe(netlink.AddrSubscribe); err != nil {
+			return E.Cause(err, "subscribe address updates")
+		}
+	}
 	return nil
 }
 
-func (m *networkUpdateMonitor) loopUpdate(minDuration time.Duration) {
+func (s *netlinkSubscriptions) stop() {
+	s.route.stop()
+	s.link.stop()
+	s.address.stop()
+}
+
+const (
+	resubscribeMin = time.Second
+	resubscribeMax = 30 * time.Second
+)
+
+func (m *networkUpdateMonitor) Start() error {
+	var subs netlinkSubscriptions
+	if err := subs.resubscribe(); err != nil {
+		subs.stop()
+		return err
+	}
+	go m.loopUpdate(&subs, time.Second)
+	return nil
+}
+
+func (m *networkUpdateMonitor) loopUpdate(subs *netlinkSubscriptions, minDuration time.Duration) {
+	defer subs.stop()
 	timer := time.NewTimer(minDuration)
 	timer.Stop()
 	defer timer.Stop()
+	retry := time.NewTimer(resubscribeMin)
+	retry.Stop()
+	defer retry.Stop()
 	var (
 		timerC  <-chan time.Time
+		retryC  <-chan time.Time
 		pending bool
+		backoff = resubscribeMin
 	)
+	// lost handles a subscription whose reader stopped. Updates it would have
+	// carried are gone, so the state is treated as changed.
+	lost := func() {
+		if retryC == nil {
+			retry.Reset(backoff)
+			retryC = retry.C
+		}
+	}
 	for {
 		select {
 		case <-m.close:
 			return
-		case <-m.routeUpdate:
-		case <-m.linkUpdate:
-		case <-m.addressUpdate:
+		case _, ok := <-subs.route.updates:
+			if !ok {
+				subs.route.stop()
+				lost()
+			}
+		case _, ok := <-subs.link.updates:
+			if !ok {
+				subs.link.stop()
+				lost()
+			}
+		case _, ok := <-subs.address.updates:
+			if !ok {
+				subs.address.stop()
+				lost()
+			}
+		case <-retryC:
+			retryC = nil
+			if err := subs.resubscribe(); err != nil {
+				m.logger.Warn(E.Cause(err, "network update monitor"))
+				backoff = min(2*backoff, resubscribeMax)
+				lost()
+				continue
+			}
+			backoff = resubscribeMin
 		case <-timerC:
 			if pending {
 				m.emit()
